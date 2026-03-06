@@ -887,6 +887,99 @@ Invariant 3: Workspace key is sanitized.
 - Only `[A-Za-z0-9._-]` allowed in workspace directory names.
 - Replace all other characters with `_`.
 
+### 9.6 Workspace Setup Examples
+
+The workspace model supports a range of directory layouts via `workspace.root` and lifecycle hooks.
+Two common patterns are shown below.
+
+#### Example A: Single Git Repository
+
+A single project where Symphony config lives inside the repo.
+
+Directory layout:
+
+```
+my-project/              # git repo root
+├── .git/
+├── src/
+└── WORKFLOW.md          # Symphony workflow config
+```
+
+WORKFLOW.md (relevant fields):
+
+```yaml
+workspace:
+  root: ./workspaces
+
+hooks:
+  after_create: |
+    git clone --depth 1 git@github.com:org/my-project.git .
+```
+
+Launch:
+
+```
+cd my-project && symphony ./WORKFLOW.md
+```
+
+When Symphony picks up issue `ABC-123`, it creates `my-project/workspaces/ABC-123/` and runs the
+`after_create` hook inside that directory, producing a shallow clone ready for the coding agent.
+
+Tradeoffs:
+
+- Simplest setup — WORKFLOW.md is versioned with the code.
+- Each workspace is a full (shallow) clone; disk usage scales linearly with active issues.
+
+#### Example B: Multi-Repository Workspace
+
+A workspace folder containing multiple local repos (e.g., a company monorepo-of-repos layout).
+
+Directory layout:
+
+```
+~/company/
+├── WORKFLOW.md              # Symphony config at workspace root
+├── backend/                 # local git repo (your working copy)
+├── frontend/                # local git repo
+├── .env.local               # secrets, local configs
+│
+└── .symphony/workspaces/    # Symphony creates per-issue dirs here
+    └── ABC-123/
+        ├── backend/         # cloned for this issue
+        ├── frontend/        # cloned for this issue
+        └── .env.local       # copied by hook
+```
+
+WORKFLOW.md (relevant fields):
+
+```yaml
+workspace:
+  root: ./.symphony/workspaces
+
+hooks:
+  after_create: |
+    git clone --depth 1 --reference ../../backend git@github.com:org/backend.git backend
+    git clone --depth 1 --reference ../../frontend git@github.com:org/frontend.git frontend
+    cp ../../.env.local .env.local
+```
+
+Launch:
+
+```
+cd ~/company && symphony ./WORKFLOW.md
+```
+
+The `--reference` flag tells git to borrow objects from the local repo instead of fetching
+everything over the network, making clones fast and saving disk space.
+
+Tradeoffs:
+
+- `--reference` avoids full network clones by borrowing objects from local repos.
+- Secrets and non-git config files are copied into each workspace via hooks.
+- WORKFLOW.md lives at the workspace root level, not inside any single repo.
+- More moving parts — hook failures (e.g., missing local repo) surface as workspace creation errors
+  per the semantics in Section 9.4.
+
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
 This section defines the language-neutral contract for integrating a coding agent app-server.
