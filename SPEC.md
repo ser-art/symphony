@@ -554,6 +554,24 @@ Provider-specific configuration for the Claude Code provider.
 This section applies when `agent.default_provider` is `"claude"` or when
 a routing rule selects the `claude` provider for an issue.
 
+Authentication:
+
+The Claude Agent SDK resolves credentials automatically in this order:
+
+1. `ANTHROPIC_API_KEY` environment variable — explicit API key, works everywhere.
+2. Local OAuth credentials — if the operator has logged in via `claude login`, the SDK
+   automatically reuses the cached OAuth token. No additional configuration is needed for
+   personal/internal use.
+3. Third-party cloud providers — `CLAUDE_CODE_USE_BEDROCK=1` (Amazon Bedrock),
+   `CLAUDE_CODE_USE_VERTEX=1` (Google Vertex AI), `CLAUDE_CODE_USE_FOUNDRY=1` (Azure AI
+   Foundry), each with their own credential chain.
+4. `apiKeyHelper` — path to a script that outputs authentication values (advanced).
+
+Note: Anthropic's terms prohibit third-party products from offering `claude.ai` login or
+rate limits to end users without prior approval. For products distributed to others, use
+`ANTHROPIC_API_KEY`. For personal or internal orchestration (which is Symphony's primary
+use case), local OAuth from `claude login` works without any extra setup.
+
 Fields:
 
 - `model` (string)
