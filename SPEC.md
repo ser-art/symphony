@@ -51,7 +51,8 @@ Important boundary:
 - Prescribing a specific dashboard or terminal UI implementation.
 - General-purpose workflow engine or distributed job scheduler.
 - Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
-  workflow prompt and agent tooling.)
+  workflow prompt and agent tooling. Section 11.6 defines recommended communication conventions
+  but does not add orchestrator enforcement.)
 - Mandating strong sandbox controls beyond what the coding agent and host OS provide.
 - Mandating a single default approval, sandbox, or operator-confirmation posture for all
   implementations.
@@ -355,6 +356,13 @@ Fields:
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings or comma-separated string)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+- `trigger_labels` (list of strings, optional)
+  - Default: empty list (no label filtering; all active-state issues are eligible).
+  - When non-empty, an issue is dispatch-eligible only if its `labels` list contains at
+    least one value matching a `trigger_labels` entry (comparison after trim + lowercase
+    normalization on both sides).
+  - This filter is additive to existing eligibility rules (active state, blockers,
+    concurrency limits).
 
 #### 5.3.2 `polling` (object)
 
@@ -373,6 +381,13 @@ Fields:
   - `~` and strings containing path separators are expanded.
   - Bare strings without path separators are preserved as-is (relative roots are allowed but
     discouraged).
+- `default_branch` (string, optional)
+  - Default: `"dev"`
+  - The branch name the workspace should target by default.
+  - Symphony does not perform git operations itself; this value is exposed as:
+    - Hook environment variable `SYMPHONY_DEFAULT_BRANCH` (see Section 9.4).
+    - Template input variable `default_branch` (see Section 5.4).
+  - The agent or hooks MAY override this using issue context (e.g., `issue.branch_name`).
 
 #### 5.3.4 `hooks` (object)
 
@@ -460,6 +475,8 @@ Template input variables:
 - `attempt` (integer or null)
   - `null`/absent on first attempt.
   - Integer on retry or continuation run.
+- `default_branch` (string)
+  - The configured `workspace.default_branch` value (default `"dev"`).
 
 Fallback prompt behavior:
 
@@ -557,8 +574,10 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `tracker.project_slug`: string, required when `tracker.kind=linear`
 - `tracker.active_states`: list/string, default `Todo, In Progress`
 - `tracker.terminal_states`: list/string, default `Closed, Cancelled, Canceled, Duplicate, Done`
+- `tracker.trigger_labels`: list of strings, default `[]` (no label filter)
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path, default `<system-temp>/symphony_workspaces`
+- `workspace.default_branch`: string, default `"dev"`
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.after_run`: shell script or null
@@ -707,6 +726,8 @@ An issue is dispatch-eligible only if all are true:
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
+- If `tracker.trigger_labels` is non-empty: at least one of the issue's `labels` matches
+  a configured trigger label (comparison after trim + lowercase on both sides).
 - Blocker rule for `Todo` state passes:
   - If the issue state is `Todo`, do not dispatch when any blocker is non-terminal.
 
@@ -860,6 +881,15 @@ Execution contract:
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 
+Hook environment variables:
+
+Hooks inherit the host process environment. In addition, the runtime sets these variables
+before hook execution:
+
+- `SYMPHONY_WORKSPACE_PATH` — absolute path of the per-issue workspace directory (same as cwd).
+- `SYMPHONY_ISSUE_IDENTIFIER` — the human-readable issue key (e.g., `ABC-123`).
+- `SYMPHONY_DEFAULT_BRANCH` — the configured `workspace.default_branch` value.
+
 Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
@@ -913,7 +943,7 @@ workspace:
 
 hooks:
   after_create: |
-    git clone --depth 1 git@github.com:org/my-project.git .
+    git clone --depth 1 -b "$SYMPHONY_DEFAULT_BRANCH" git@github.com:org/my-project.git .
 ```
 
 Launch:
@@ -1311,6 +1341,43 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
   `Human Review`) rather than tracker terminal state `Done`.
 - If the optional `linear_graphql` client-side tool extension is implemented, it is still part of
   the agent toolchain rather than orchestrator business logic.
+
+Note: Workflow prompts commonly constrain which tracker states the agent is allowed to set.
+For example, a prompt may instruct the agent to never transition an issue to a terminal state
+(e.g., `Done`) unless a pull request has been merged. Such constraints are policy-layer
+concerns defined in WORKFLOW.md, not orchestrator-enforced rules.
+
+See Section 11.6 for recommended agent communication conventions (reply threading, workpad
+pattern) that workflow prompts should follow.
+
+### 11.6 Agent Communication Conventions (Recommended)
+
+This section defines recommended conventions for how agents communicate on the issue tracker.
+These conventions are not enforced by the orchestrator. They are contracts that workflow prompts
+SHOULD implement and that future tooling MAY rely on for consistency.
+
+#### 11.6.1 Reply Threading Rule
+
+When the agent posts a response to user communication on an issue:
+
+- If the user wrote in an existing comment thread, the agent MUST reply within that same thread.
+- If the user posted a new top-level comment, the agent SHOULD create a reply to that comment
+  (starting or continuing a thread on it) rather than posting a separate top-level comment.
+- Top-level comments from the agent are reserved for agent-initiated communication (e.g.,
+  the workpad pattern described in Section 11.6.2).
+
+Rationale: Threading keeps conversations discoverable and prevents tracker noise when multiple
+topics are discussed on a single issue.
+
+#### 11.6.2 Workpad Convention (Optional)
+
+Workflow prompts MAY define a persistent "workpad" comment pattern where the agent maintains a
+single top-level comment as a living document for progress tracking.
+
+When both the workpad pattern and reply threading are used:
+- The workpad comment is agent-initiated and top-level.
+- User replies to the workpad are threaded; the agent replies within the same thread.
+- User comments on other topics get their own reply threads per Section 11.6.1.
 
 ## 12. Prompt Construction and Context Assembly
 
@@ -2059,6 +2126,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
+- `SYMPHONY_DEFAULT_BRANCH` and other hook env vars are set during hook execution
 
 ### 17.3 Issue Tracker Client
 
@@ -2087,6 +2155,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason
+- When `trigger_labels` is empty, all active-state issues are eligible (no label filter)
+- When `trigger_labels` is non-empty, only issues with at least one matching label are eligible
+- Label matching is case-insensitive (trim + lowercase)
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
@@ -2174,13 +2245,15 @@ Use the same validation profiles as Section 17:
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
 - Coding-agent app-server subprocess client with JSON line protocol
 - Codex launch command config (`codex.command`, default `codex app-server`)
-- Strict prompt rendering with `issue` and `attempt` variables
+- Strict prompt rendering with `issue`, `attempt`, and `default_branch` variables
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
 - Reconciliation that stops runs on terminal/non-active tracker states
 - Workspace cleanup for terminal issues (startup sweep + active transition)
 - Structured logs with `issue_id`, `issue_identifier`, and `session_id`
 - Operator-visible observability (structured logs; optional snapshot/status surface)
+- Hook environment variables (`SYMPHONY_DEFAULT_BRANCH`, `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_WORKSPACE_PATH`)
+- Optional label-based dispatch filtering (`tracker.trigger_labels`)
 
 ### 18.2 Recommended Extensions (Not Required for Conformance)
 
