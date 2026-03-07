@@ -1,6 +1,8 @@
 # Symphony Service Specification
 
-Status: Draft v1 (language-agnostic)
+Status: Draft v2
+
+Implementation: TypeScript (Bun runtime), targeting Claude Code and Codex as agent providers.
 
 Purpose: Define a service that orchestrates coding agents to get project work done.
 
@@ -17,6 +19,8 @@ The service solves four operational problems:
   workspace directories.
 - It keeps the workflow policy in-repo (`WORKFLOW.md`) so teams version the agent prompt and runtime
   settings with their code.
+- It supports multiple coding agent providers (Codex, Claude Code) behind a unified interface, with
+  label-based routing from the issue tracker.
 - It provides enough observability to operate and debug multiple concurrent agent runs.
 
 Implementations are expected to document their trust and safety posture explicitly. This
@@ -92,15 +96,27 @@ Important boundary:
 6. `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
+   - Delegates to the selected provider to launch a coding agent session.
    - Streams agent updates back to the orchestrator.
 
-7. `Status Surface` (optional)
+7. `Provider Registry`
+   - Manages available agent providers (Codex, Claude Code).
+   - Each provider implements a common interface for session lifecycle (start, send prompt, stream
+     events, stop).
+   - The orchestrator selects a provider per issue based on routing rules.
+
+8. `Agent System Executor` (future extension)
+   - Runs multi-step agent pipelines.
+   - v1 ships with `simple` system only (single provider, single step).
+   - Future systems enable sequential pipelines (implement → review), parallel execution
+     (dual-implementation), and hierarchical planner-worker patterns.
+
+9. `Status Surface` (optional)
    - Presents human-readable runtime status (for example terminal output, dashboard, or other
      operator-facing view).
 
-8. `Logging`
-   - Emits structured runtime logs to one or more configured sinks.
+10. `Logging`
+    - Emits structured runtime logs to one or more configured sinks.
 
 ### 3.2 Abstraction Levels
 
@@ -131,8 +147,36 @@ Symphony is easiest to port when kept in these layers:
 - Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
 - Local filesystem for workspaces and logs.
 - Optional workspace population tooling (for example Git CLI, if used).
-- Coding-agent executable that supports JSON-RPC-like app-server mode over stdio.
+- Coding-agent providers:
+  - Codex app-server executable (JSON-RPC 2.0 over stdio).
+  - Claude Code CLI or Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`).
+- `@linear/sdk` for typed Linear GraphQL access (TypeScript implementation).
 - Host environment authentication for the issue tracker and coding agent.
+
+### 3.4 Implementation Technology
+
+The canonical implementation uses:
+
+- **Runtime**: Bun (https://bun.sh) — JavaScript/TypeScript runtime with single-binary compilation
+  (`bun build --compile`).
+- **Language**: TypeScript (strict mode).
+- **Key dependencies**:
+  - `@anthropic-ai/claude-agent-sdk` — official Claude Agent SDK for Claude Code provider.
+  - `@linear/sdk` — official Linear GraphQL SDK for issue tracker integration.
+  - Codex app-server — spawned as subprocess, JSON-RPC 2.0 over stdio (same protocol as Elixir
+    reference implementation).
+- **Distribution**: Single standalone binary via `bun build --compile` (~57 MB). No runtime
+  installation required on target machines.
+
+Rationale for TypeScript/Bun:
+
+- Official first-party SDKs for both Claude (Agent SDK) and Linear exist only in
+  TypeScript/Python.
+- Claude Code itself is built on Bun (Anthropic acquired Bun in December 2025).
+- MCP (Model Context Protocol) reference SDK is TypeScript-first.
+- Bun compile produces standalone binaries proven at scale (Claude Code ships as a Bun binary).
+- Symphony is I/O-bound (polling APIs, managing subprocesses, streaming stdio); CPU performance
+  differences between runtimes are not material.
 
 ## 4. Core Domain Model
 
@@ -223,13 +267,13 @@ Fields:
 - `session_id` (string, `<thread_id>-<turn_id>`)
 - `thread_id` (string)
 - `turn_id` (string)
-- `codex_app_server_pid` (string or null)
-- `last_codex_event` (string/enum or null)
-- `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
-- `codex_input_tokens` (integer)
-- `codex_output_tokens` (integer)
-- `codex_total_tokens` (integer)
+- `agent_process_pid` (string or null)
+- `last_agent_event` (string/enum or null)
+- `last_agent_timestamp` (timestamp or null)
+- `last_agent_message` (summarized payload)
+- `agent_input_tokens` (integer)
+- `agent_output_tokens` (integer)
+- `agent_total_tokens` (integer)
 - `last_reported_input_tokens` (integer)
 - `last_reported_output_tokens` (integer)
 - `last_reported_total_tokens` (integer)
@@ -249,7 +293,35 @@ Fields:
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
 
-#### 4.1.8 Orchestrator Runtime State
+#### 4.1.8 Provider Definition
+
+An agent provider that can run coding sessions.
+
+Fields:
+
+- `name` (string) — unique provider identifier (e.g., `codex`, `claude`)
+- `kind` (enum: `codex_app_server`, `claude_agent_sdk`) — provider protocol type
+- Provider-specific configuration (see Sections 5.3.6 and 5.3.7)
+
+#### 4.1.9 Agent System Definition
+
+A named, composable definition of how an issue is processed by one or more agent steps.
+
+Fields:
+
+- `name` (string) — unique system identifier (e.g., `simple`)
+- `steps` (ordered list of AgentStep)
+
+AgentStep fields:
+
+- `name` (string) — step identifier within the system
+- `provider` (string) — provider name or `"default"` to use `agent.default_provider`
+- `prompt_template` (string, optional) — step-specific prompt override; defaults to workflow prompt
+
+v1 ships with a single built-in system `simple` containing one step that uses the default provider
+and workflow prompt. Custom system definitions are a future extension.
+
+#### 4.1.10 Orchestrator Runtime State
 
 Single authoritative in-memory state owned by the orchestrator.
 
@@ -261,8 +333,8 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `codex_totals` (aggregate tokens + runtime seconds)
-- `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- `agent_totals` (aggregate tokens + runtime seconds)
+- `agent_rate_limits` (latest rate-limit snapshot from agent events)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -325,6 +397,8 @@ Top-level keys:
 - `hooks`
 - `agent`
 - `codex`
+- `claude`
+- `routing`
 
 Unknown keys should be ignored for forward compatibility.
 
@@ -431,8 +505,20 @@ Fields:
   - Default: `"ru"`
   - The language the agent should use when communicating with users (e.g., issue comments, workpad updates).
   - Exposed as template variable `language` (Section 5.4) and hook environment variable `SYMPHONY_LANGUAGE` (Section 9.4).
+- `default_provider` (string, optional)
+  - Default: `"codex"`
+  - The provider to use when no routing rule or label override selects a specific provider.
+  - Must reference a configured provider name.
+- `default_system` (string, optional)
+  - Default: `"simple"`
+  - The agent system to use when no routing rule selects a specific system.
+  - v1 only supports `"simple"`.
 
 #### 5.3.6 `codex` (object)
+
+Provider-specific configuration for the Codex app-server provider.
+This section applies when `agent.default_provider` is `"codex"` or when
+a routing rule selects the `codex` provider for an issue.
 
 Fields:
 
@@ -461,6 +547,67 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+
+#### 5.3.7 `claude` (object)
+
+Provider-specific configuration for the Claude Code provider.
+This section applies when `agent.default_provider` is `"claude"` or when
+a routing rule selects the `claude` provider for an issue.
+
+Fields:
+
+- `model` (string)
+  - Default: `"claude-sonnet-4-6"`
+  - The Claude model to use for agent sessions.
+  - Supported values depend on the Claude Agent SDK version and account access.
+- `max_turns` (integer)
+  - Default: `20`
+  - Maximum number of agentic turns per session. Maps to Agent SDK `maxTurns`.
+- `permission_mode` (string)
+  - Default: `"dangerouslySkipPermissions"`
+  - Controls how Claude Code handles tool permissions in headless mode.
+  - Values: `"dangerouslySkipPermissions"`, `"default"`, `"plan"`, `"bypassPermissions"`
+- `turn_timeout_ms` (integer)
+  - Default: `3600000` (1 hour)
+  - Maximum wall-clock time for a single agent session.
+- `stall_timeout_ms` (integer)
+  - Default: `300000` (5 minutes)
+  - If `<= 0`, stall detection is disabled.
+
+#### 5.3.8 `routing` (object, optional)
+
+Rules for selecting a provider and/or agent system per issue based on issue metadata.
+
+Fields:
+
+- `rules` (list of routing rule objects, optional)
+  - Default: empty list (all issues use `agent.default_provider` and `agent.default_system`).
+  - Rules are evaluated in order; first match wins.
+  - Each rule:
+    - `labels` (list of strings) — issue must have at least one matching label (trim + lowercase).
+    - `provider` (string, optional) — override provider for matched issues.
+    - `system` (string, optional) — override agent system for matched issues.
+    - At least one of `provider` or `system` must be present.
+
+Example:
+
+```yaml
+routing:
+  rules:
+    - labels: [claude]
+      provider: claude
+    - labels: [codex]
+      provider: codex
+    - labels: [deep-review]
+      system: implement-and-review
+```
+
+Resolution order:
+
+1. Evaluate `routing.rules` against issue labels; first match wins.
+2. If no rule matches, or matched rule omits `provider`/`system`, fall back to
+   `agent.default_provider` / `agent.default_system`.
+3. The selected provider name must reference a configured provider section (`codex` or `claude`).
 
 ### 5.4 Prompt Template Contract
 
@@ -532,7 +679,7 @@ Dynamic reload is required:
 - The software should watch `WORKFLOW.md` for changes.
 - On change, it should re-read and re-apply workflow config and prompt template without restart.
 - The software should attempt to adjust live behavior to the new config (for example polling
-  cadence, concurrency limits, active/terminal states, codex settings, workspace paths/hooks, and
+  cadence, concurrency limits, active/terminal states, provider settings, workspace paths/hooks, and
   prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
   execution, and agent launches.
@@ -568,7 +715,10 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_slug` is present when required by the selected tracker kind.
-- `codex.command` is present and non-empty.
+- At least one provider section (`codex` or `claude`) must be configured and valid.
+- `agent.default_provider` must reference a valid provider.
+- If `codex` provider is used: `codex.command` is present and non-empty.
+- If `claude` provider is used: `claude.model` is present and non-empty.
 
 ### 6.4 Config Fields Summary (Cheat Sheet)
 
@@ -594,6 +744,8 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `agent.language`: string, default `"ru"`
+- `agent.default_provider`: string, default `"codex"`
+- `agent.default_system`: string, default `"simple"`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -601,6 +753,12 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `claude.model`: string, default `"claude-sonnet-4-6"`
+- `claude.max_turns`: integer, default `20`
+- `claude.permission_mode`: string, default `"dangerouslySkipPermissions"`
+- `claude.turn_timeout_ms`: integer, default `3600000`
+- `claude.stall_timeout_ms`: integer, default `300000`
+- `routing.rules`: list of routing rule objects, default `[]`
 - `server.port` (extension): integer, optional; enables the optional HTTP server, `0` may be used
   for ephemeral local bind, and CLI `--port` overrides it
 
@@ -682,7 +840,7 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule exponential-backoff retry.
 
-- `Codex Update Event`
+- `Agent Update Event`
   - Update live session fields, token counters, and rate limits.
 
 - `Retry Timer Fired`
@@ -794,9 +952,10 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
+  - `last_agent_timestamp` if any event has been seen, else
   - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- If `elapsed_ms > provider.stall_timeout_ms` (from the active provider's config), terminate the
+  worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
 Part B: Tracker state refresh
@@ -1018,9 +1177,16 @@ Tradeoffs:
 - More moving parts — hook failures (e.g., missing local repo) surface as workspace creation errors
   per the semantics in Section 9.4.
 
-## 10. Agent Runner Protocol (Coding Agent Integration)
+## 10. Agent Runner Protocol (Multi-Provider)
 
-This section defines the language-neutral contract for integrating a coding agent app-server.
+Symphony supports multiple agent providers behind a unified runner interface.
+Each provider implements the same lifecycle contract: start session, send prompt,
+stream events, stop session. The orchestrator is provider-agnostic — it receives
+normalized `AgentEvent` records regardless of which provider produced them.
+
+The following subsections define the protocol for each supported provider.
+
+This section defines the language-neutral contract for integrating coding agent providers.
 
 Compatibility profile:
 
@@ -1031,6 +1197,9 @@ Compatibility profile:
 - Implementations should tolerate equivalent payload shapes when they carry the same logical
   meaning, especially for nested IDs, approval requests, user-input-required signals, and
   token/rate-limit metadata.
+
+Sections 10.1 through 10.7 define the protocol for the Codex app-server provider
+(`agent.default_provider: codex`).
 
 ### 10.1 Launch Contract
 
@@ -1135,7 +1304,7 @@ include:
 
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
-- `codex_app_server_pid` (if available)
+- `agent_process_pid` (if available)
 - optional `usage` map (token counts)
 - payload fields as needed
 
@@ -1270,6 +1439,46 @@ Behavior:
 Note:
 
 - Workspaces are intentionally preserved after successful runs.
+
+### 10.8 Claude Code Provider Protocol
+
+The Claude Code provider uses the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`)
+to run agent sessions programmatically.
+
+#### 10.8.1 Launch Contract
+
+- No subprocess spawning required; the SDK manages the agent lifecycle internally.
+- The SDK is invoked with:
+  - `model`: from `claude.model`
+  - `prompt`: rendered workflow prompt
+  - `workingDirectory`: workspace path
+  - `maxTurns`: from `claude.max_turns`
+  - `permissionMode`: from `claude.permission_mode`
+- The SDK returns an async iterable of agent messages.
+
+#### 10.8.2 Session Lifecycle
+
+1. Create SDK query with workspace path and prompt.
+2. Iterate over the async message stream.
+3. Normalize each SDK message into the same AgentEvent schema used by the Codex provider
+   (session_started, turn_completed, turn_failed, notification, etc.).
+4. Forward normalized events to the orchestrator callback.
+5. On completion or error, clean up the SDK session.
+
+#### 10.8.3 Event Normalization
+
+Claude Agent SDK messages must be mapped to the same event types defined in Section 10.4:
+
+- SDK `result` messages → `turn_completed` or `turn_failed`
+- SDK `tool_use` messages → `notification` (with tool name/status summary)
+- SDK token usage → `usage` map with `input_tokens`, `output_tokens`, `total_tokens`
+- SDK errors → `turn_failed` or `turn_ended_with_error`
+
+#### 10.8.4 Timeouts
+
+- `claude.turn_timeout_ms`: enforced by the runner via AbortController on the SDK query.
+- `claude.stall_timeout_ms`: enforced by the orchestrator (same mechanism as Codex stall
+  detection).
 
 ## 11. Issue Tracker Integration Contract (Linear-Compatible)
 
@@ -1459,7 +1668,7 @@ should return:
 - `running` (list of running session rows)
 - each running row should include `turn_count`
 - `retrying` (list of retry queue rows)
-- `codex_totals`
+- `agent_totals`
   - `input_tokens`
   - `output_tokens`
   - `total_tokens`
@@ -1597,7 +1806,7 @@ Minimum endpoints:
           "error": "no available orchestrator slots"
         }
       ],
-      "codex_totals": {
+      "agent_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,
         "total_tokens": 7400,
@@ -1817,7 +2026,7 @@ Implications:
 
 ### 15.5 Harness Hardening Guidance
 
-Running Codex agents against repositories, issue trackers, and other inputs that may contain
+Running coding agents against repositories, issue trackers, and other inputs that may contain
 sensitive data or externally-controlled content can be dangerous. A permissive deployment can lead
 to data leaks, destructive mutations, or full machine compromise if the agent is induced to execute
 harmful commands or use overly-powerful integrations.
@@ -1829,10 +2038,10 @@ fully trustworthy just because they originate inside a normal workflow.
 
 Possible hardening measures include:
 
-- Tightening Codex approval and sandbox settings described elsewhere in this specification instead
+- Tightening agent approval and sandbox settings described elsewhere in this specification instead
   of running with a maximally permissive configuration.
 - Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
-  separate credentials beyond the built-in Codex policy controls.
+  separate credentials beyond the built-in agent policy controls.
 - Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
 - Narrowing the optional `linear_graphql` tool so it can only read or mutate data inside the
@@ -1860,8 +2069,8 @@ function start_service():
     claimed: set(),
     retry_attempts: {},
     completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-    codex_rate_limits: null
+    agent_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+    agent_rate_limits: null
   }
 
   validation = validate_dispatch_config()
@@ -1953,13 +2162,13 @@ function dispatch_issue(issue, state, attempt):
     identifier: issue.identifier,
     issue,
     session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
+    agent_process_pid: null,
+    last_agent_message: null,
+    last_agent_event: null,
+    last_agent_timestamp: null,
+    agent_input_tokens: 0,
+    agent_output_tokens: 0,
+    agent_total_tokens: 0,
     last_reported_input_tokens: 0,
     last_reported_output_tokens: 0,
     last_reported_total_tokens: 0,
@@ -2002,7 +2211,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
       session=session,
       prompt=prompt,
       issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+      on_message=(msg) -> send(orchestrator_channel, {agent_update, issue.id, msg})
     )
 
     if turn_result failed:
@@ -2194,6 +2403,12 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   telemetry are accepted when they preserve the same logical meaning
 - If optional client-side tools are implemented, the startup handshake advertises the supported tool
   specs required for discovery by the targeted app-server version
+- Provider selection uses `agent.default_provider` when no routing rule matches
+- Routing rules match issue labels and override provider/system
+- Label matching in routing rules is case-insensitive
+- Claude provider normalizes SDK events to standard AgentEvent schema
+- Claude provider enforces turn timeout via AbortController
+- Provider-specific config (`codex.*` vs `claude.*`) is applied to the correct provider
 - If the optional `linear_graphql` client-side tool extension is implemented:
   - the tool is advertised to the session
   - valid `query` / `variables` inputs execute against configured Linear auth
@@ -2264,6 +2479,12 @@ Use the same validation profiles as Section 17:
 - Operator-visible observability (structured logs; optional snapshot/status surface)
 - Hook environment variables (`SYMPHONY_DEFAULT_BRANCH`, `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_WORKSPACE_PATH`)
 - Optional label-based dispatch filtering (`tracker.trigger_labels`)
+- Provider registry with at least Codex and Claude Code providers
+- `agent.default_provider` config field with routing fallback
+- `claude.*` provider-specific configuration section
+- `routing.rules` label-based provider/system selection
+- Claude Agent SDK integration with event normalization
+- Provider selection per issue dispatch
 
 ### 18.2 Recommended Extensions (Not Required for Conformance)
 
@@ -2284,3 +2505,99 @@ Use the same validation profiles as Section 17:
 - Verify hook execution and workflow path resolution on the target host OS/shell environment.
 - If the optional HTTP server is shipped, verify the configured port behavior and loopback/default
   bind expectations on the target environment.
+
+## 19. Agent Systems (Future Extension)
+
+This section documents the planned multi-step agent system architecture.
+v1 ships with the `simple` system only. This section is informational and
+not required for v1 conformance.
+
+### 19.1 Concept
+
+An agent system defines how an issue is processed through one or more agent steps.
+Each step specifies a provider, a prompt, and optional control flow (conditions,
+iteration limits, parallelism).
+
+### 19.2 Built-in Systems
+
+#### `simple` (v1, default)
+
+Single step using the default provider and workflow prompt. Equivalent to current
+behavior.
+
+### 19.3 Planned Systems (Post-v1)
+
+#### `implement-and-review`
+
+Sequential pipeline:
+
+1. `implement` step — default provider implements the feature.
+2. `review` step — a different provider reviews the changes.
+3. `rework` step — conditional, runs if review finds issues. Max 3 iterations.
+
+#### `dual-implementation`
+
+Parallel comparison:
+
+1. `impl_a` and `impl_b` steps run in parallel on separate git worktrees using
+   different providers.
+2. `compare` step evaluates both solutions and selects the better one.
+
+#### `planner-workers` (Cursor-style)
+
+Hierarchical delegation inspired by https://cursor.com/blog/self-driving-codebases:
+
+1. `plan` step — a planner agent breaks the issue into subtasks.
+2. `execute` step — fans out to N parallel workers, one per subtask.
+3. `integrate` step — reviews and integrates all subtask results.
+
+### 19.4 System Definition Schema (Draft)
+
+Agent system definitions will be expressible in WORKFLOW.md front matter:
+
+```yaml
+systems:
+  implement-and-review:
+    steps:
+      - name: implement
+        provider: codex
+      - name: review
+        provider: claude
+        prompt: "Review the changes..."
+      - name: rework
+        provider: codex
+        condition: "steps.review.verdict == 'rework'"
+        max_iterations: 3
+```
+
+### 19.5 Inter-Step Communication
+
+Each step produces a StepResult:
+
+- `status` (success | failure | rework_needed)
+- `summary` (text summary of what was done)
+- `diff` (git diff of changes, if applicable)
+- `artifacts` (named outputs for downstream steps)
+
+Subsequent steps receive previous StepResults as template variables.
+
+### 19.6 Workspace Isolation for Parallel Steps
+
+Parallel steps require separate git worktrees to avoid conflicts.
+The workspace manager creates sub-worktrees under the issue workspace:
+
+```
+<workspace_root>/<issue_id>/
+  ├── _main/           # primary worktree
+  ├── _step_impl_a/    # parallel step worktree
+  └── _step_impl_b/    # parallel step worktree
+```
+
+### 19.7 Budget Controls
+
+Every agent system execution is bounded by:
+
+- `max_total_steps` — hard cap on total agent invocations across all steps.
+- Per-step `max_iterations` — for review/rework loops.
+- `max_tokens_budget` — aggregate token cost cap.
+- `timeout_ms` — wall-clock cap for the entire system execution.
