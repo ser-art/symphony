@@ -427,6 +427,10 @@ Fields:
   - Default: empty map.
   - State keys are normalized (`trim` + `lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
+- `language` (string, optional)
+  - Default: `"ru"`
+  - The language the agent should use when communicating with users (e.g., issue comments, workpad updates).
+  - Exposed as template variable `language` (Section 5.4) and hook environment variable `SYMPHONY_LANGUAGE` (Section 9.4).
 
 #### 5.3.6 `codex` (object)
 
@@ -477,6 +481,8 @@ Template input variables:
   - Integer on retry or continuation run.
 - `default_branch` (string)
   - The configured `workspace.default_branch` value (default `"dev"`).
+- `language` (string)
+  - The configured `agent.language` value (default `"ru"`).
 
 Fallback prompt behavior:
 
@@ -587,6 +593,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `agent.language`: string, default `"ru"`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -889,6 +896,7 @@ before hook execution:
 - `SYMPHONY_WORKSPACE_PATH` — absolute path of the per-issue workspace directory (same as cwd).
 - `SYMPHONY_ISSUE_IDENTIFIER` — the human-readable issue key (e.g., `ABC-123`).
 - `SYMPHONY_DEFAULT_BRANCH` — the configured `workspace.default_branch` value.
+- `SYMPHONY_LANGUAGE` — the configured `agent.language` value.
 
 Failure semantics:
 
@@ -2109,6 +2117,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `codex.command` is preserved as a shell command string
 - Per-state concurrency override map normalizes state names and ignores invalid values
 - Prompt template renders `issue` and `attempt`
+- Prompt template renders `language` variable
 - Prompt rendering fails on unknown variables (strict mode)
 
 ### 17.2 Workspace Manager and Safety
@@ -2127,6 +2136,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Workspace path sanitization and root containment invariants are enforced before agent launch
 - Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
 - `SYMPHONY_DEFAULT_BRANCH` and other hook env vars are set during hook execution
+- `SYMPHONY_LANGUAGE` is set during hook execution
 
 ### 17.3 Issue Tracker Client
 
