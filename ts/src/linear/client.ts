@@ -51,18 +51,6 @@ query CandidateIssues($projectSlug: String!, $states: [String!]!, $after: String
           name
         }
       }
-      relations(first: 50) {
-        nodes {
-          type
-          relatedIssue {
-            id
-            identifier
-            state {
-              name
-            }
-          }
-        }
-      }
       inverseRelations(first: 50) {
         nodes {
           type
@@ -124,18 +112,6 @@ query IssueStatesByIds($ids: [ID!]!) {
       labels {
         nodes {
           name
-        }
-      }
-      relations(first: 50) {
-        nodes {
-          type
-          relatedIssue {
-            id
-            identifier
-            state {
-              name
-            }
-          }
         }
       }
       inverseRelations(first: 50) {
@@ -284,6 +260,7 @@ export class LinearClient {
         "Content-Type": "application/json",
         Authorization: this.apiKey,
       },
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(NETWORK_TIMEOUT),
     });
 
@@ -359,19 +336,6 @@ function normalizeIssue(node: any): Issue {
           id: rel.issue.id ?? null,
           identifier: rel.issue.identifier ?? null,
           state: rel.issue.state?.name ?? null,
-        });
-      }
-    }
-  }
-
-  // Also check relations for blocks type (bidirectional)
-  if (node.relations?.nodes) {
-    for (const rel of node.relations.nodes) {
-      if (rel.type === "blocks" && rel.relatedIssue) {
-        blockedBy.push({
-          id: rel.relatedIssue.id ?? null,
-          identifier: rel.relatedIssue.identifier ?? null,
-          state: rel.relatedIssue.state?.name ?? null,
         });
       }
     }
