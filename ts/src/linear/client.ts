@@ -94,9 +94,9 @@ query IssuesByStates($projectSlug: String!, $states: [String!]!, $after: String)
 `;
 
 const ISSUE_STATES_BY_IDS_QUERY = `
-query IssueStatesByIds($ids: [ID!]!) {
-  nodes(ids: $ids) {
-    ... on Issue {
+query IssueStatesByIds($ids: [UUID!]!) {
+  issues(filter: { id: { in: $ids } }, first: 50) {
+    nodes {
       id
       identifier
       title
@@ -235,7 +235,7 @@ export class LinearClient {
     if (ids.length === 0) return [];
 
     const data = await this.graphql(ISSUE_STATES_BY_IDS_QUERY, { ids });
-    const nodes = data?.nodes;
+    const nodes = data?.issues?.nodes;
     if (!Array.isArray(nodes)) {
       throw new LinearApiError(
         "linear_unknown_payload",
