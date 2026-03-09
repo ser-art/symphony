@@ -94,7 +94,7 @@ query IssuesByStates($projectSlug: String!, $states: [String!]!, $after: String)
 `;
 
 const ISSUE_STATES_BY_IDS_QUERY = `
-query IssueStatesByIds($ids: [UUID!]!) {
+query IssueStatesByIds($ids: [ID!]!) {
   issues(filter: { id: { in: $ids } }, first: 50) {
     nodes {
       id
