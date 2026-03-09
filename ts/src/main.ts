@@ -9,6 +9,23 @@ import { WorkflowWatcher } from "./watcher";
 import { HttpServer } from "./server";
 import { logger, setLogLevel } from "./logger";
 
+function loadEnvFile(filePath: string): void {
+  const fs = require("fs") as typeof import("fs");
+  const path = require("path") as typeof import("path");
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) return;
+  const content = fs.readFileSync(resolved, "utf-8");
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const value = trimmed.slice(eqIdx + 1).trim();
+    if (!process.env[key]) process.env[key] = value;
+  }
+}
+
 function parseArgs(): { workflowPath: string; port: number | null; logsRoot: string | null } {
   const args = process.argv.slice(2);
   let workflowPath = resolve("WORKFLOW.md");
@@ -23,6 +40,8 @@ function parseArgs(): { workflowPath: string; port: number | null; logsRoot: str
       logsRoot = args[++i] ?? null;
     } else if (arg === "--debug") {
       setLogLevel("debug");
+    } else if (arg === "--env" && i + 1 < args.length) {
+      loadEnvFile(args[++i]!);
     } else if (!arg.startsWith("-")) {
       workflowPath = resolve(arg);
     }
@@ -32,6 +51,8 @@ function parseArgs(): { workflowPath: string; port: number | null; logsRoot: str
 }
 
 async function main(): Promise<void> {
+  loadEnvFile(".env");
+
   const { workflowPath, port: cliPort, logsRoot } = parseArgs();
 
   logger.info("Symphony TypeScript starting", { workflow: workflowPath });

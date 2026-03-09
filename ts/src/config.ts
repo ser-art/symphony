@@ -276,7 +276,7 @@ export function buildConfig(workflow: WorkflowDefinition): ServiceConfig {
       permissionMode: getStr(
         claude,
         "permission_mode",
-        "dangerouslySkipPermissions",
+        "bypassPermissions",
       ),
       turnTimeoutMs: getInt(claude, "turn_timeout_ms", 3600000),
       stallTimeoutMs: getInt(claude, "stall_timeout_ms", 300000),

@@ -27,6 +27,7 @@ class ClaudeSession implements AgentSession {
   private params: SessionParams;
   threadId: string | null = null;
   private aborted = false;
+  private activeQuery: { close(): void } | null = null;
 
   private constructor(config: ClaudeConfig, params: SessionParams) {
     this.config = config;
@@ -64,78 +65,96 @@ class ClaudeSession implements AgentSession {
 
     const { query } = claudeSDK;
 
-    try {
-      const turnTimeout = AbortSignal.timeout(this.config.turnTimeoutMs);
-      const combinedSignal = AbortSignal.any([
-        this.params.signal,
-        turnTimeout,
-      ]);
+    const abortController = new AbortController();
 
-      const result = await query({
-        model: this.config.model,
+    // Wire session signal into our controller
+    const onAbort = () => abortController.abort();
+    this.params.signal.addEventListener("abort", onAbort);
+
+    // Turn timeout
+    const turnTimer = setTimeout(
+      () => abortController.abort(),
+      this.config.turnTimeoutMs,
+    );
+
+    try {
+      const q = query({
         prompt,
-        workingDirectory: this.params.workspacePath,
-        maxTurns: this.config.maxTurns,
-        permissionMode: this.config.permissionMode as any,
-        abortSignal: combinedSignal,
-        onMessage: (message: any) => {
-          this.handleMessage(message);
+        options: {
+          cwd: this.params.workspacePath,
+          model: this.config.model,
+          maxTurns: this.config.maxTurns,
+          permissionMode: this.config.permissionMode as any,
+          allowDangerouslySkipPermissions:
+            this.config.permissionMode === "bypassPermissions",
+          abortController,
+          persistSession: false,
         },
       });
 
-      // Extract final result
-      if (result?.error) {
-        this.emitEvent("turn_failed", result.error);
-        return { status: "failed", error: result.error };
+      this.activeQuery = q;
+
+      for await (const message of q) {
+        if (!message || !message.type) continue;
+
+        switch (message.type) {
+          case "system":
+            if (message.subtype === "init" && message.session_id) {
+              this.threadId = message.session_id;
+              this.emitEvent("session_started");
+            }
+            break;
+
+          case "assistant": {
+            const usage = message.message?.usage;
+            if (usage) {
+              // BetaUsage uses snake_case: input_tokens, output_tokens
+              const inputTokens = usage.input_tokens ?? 0;
+              const outputTokens = usage.output_tokens ?? 0;
+              this.params.onEvent({
+                event: "other_message",
+                timestamp: new Date(),
+                usage: {
+                  inputTokens,
+                  outputTokens,
+                  totalTokens: inputTokens + outputTokens,
+                },
+              });
+            }
+            break;
+          }
+
+          case "result": {
+            if (message.subtype === "success") {
+              this.emitEvent("turn_completed");
+              return { status: "completed" };
+            }
+            // Error result
+            const errorMsg =
+              message.errors?.join("; ") ??
+              message.subtype ??
+              "agent error";
+            this.emitEvent("turn_ended_with_error", errorMsg);
+            return { status: "failed", error: errorMsg };
+          }
+        }
       }
 
+      // Generator exhausted without result message
       this.emitEvent("turn_completed");
       return { status: "completed" };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes("abort") || msg.includes("timeout")) {
-        this.emitEvent("turn_failed", "turn_timeout");
-        return { status: "failed", error: "turn_timeout" };
+      if (this.aborted || msg.includes("abort") || msg.includes("Abort")) {
+        this.emitEvent("turn_cancelled");
+        return { status: "cancelled" };
       }
       this.emitEvent("turn_failed", msg);
       return { status: "failed", error: msg };
-    }
-  }
-
-  private handleMessage(message: any): void {
-    if (!message) return;
-
-    const type = message.type ?? "";
-
-    // Tool use notifications
-    if (type === "tool_use" || type === "tool_result") {
-      const toolName = message.name ?? message.tool_name ?? "";
-      this.emitEvent("notification", `tool: ${toolName}`);
-    }
-
-    // Result messages
-    if (type === "result") {
-      if (message.subtype === "error" || message.error) {
-        this.emitEvent(
-          "turn_ended_with_error",
-          message.error ?? "result error",
-        );
-      }
-    }
-
-    // Token usage
-    if (message.usage) {
-      const usage = message.usage;
-      this.params.onEvent({
-        event: "other_message",
-        timestamp: new Date(),
-        usage: {
-          inputTokens: usage.input_tokens ?? 0,
-          outputTokens: usage.output_tokens ?? 0,
-          totalTokens:
-            (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
-        },
-      });
+    } finally {
+      clearTimeout(turnTimer);
+      this.params.signal.removeEventListener("abort", onAbort);
+      this.activeQuery = null;
     }
   }
 
@@ -149,5 +168,6 @@ class ClaudeSession implements AgentSession {
 
   async stop(): Promise<void> {
     this.aborted = true;
+    this.activeQuery?.close();
   }
 }
